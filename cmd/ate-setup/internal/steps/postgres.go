@@ -121,6 +121,13 @@ type postgresPlan struct {
 	external string
 }
 
+// postgresPrepared holds the database plan and, for the bundled database, the
+// rendered objects to apply.
+type postgresPrepared struct {
+	plan    postgresPlan
+	objects []*unstructured.Unstructured
+}
+
 // planPostgres decides between the bundled database and an external one,
 // configured either as an explicit DSN or as a Cloud SQL instance — the
 // latter possibly adopted from the cluster.
@@ -140,12 +147,12 @@ func (e *Env) planPostgres(ctx context.Context) (postgresPlan, error) {
 
 // deployPostgres applies, waits for, and sets up bundled PostgreSQL, or logs
 // that it was skipped in favor of an external database.
-func (e *Env) deployPostgres(ctx context.Context, plan postgresPlan) error {
-	if !plan.bundled {
-		log.Stepf("Skipping bundled PostgreSQL: external database configured (%s)", plan.external)
+func (e *Env) deployPostgres(ctx context.Context, prepared postgresPrepared) error {
+	if !prepared.plan.bundled {
+		log.Stepf("Skipping bundled PostgreSQL: external database configured (%s)", prepared.plan.external)
 		return nil
 	}
-	if err := e.applyPostgres(ctx); err != nil {
+	if err := e.Kube.Apply(ctx, prepared.objects); err != nil {
 		return err
 	}
 	return e.waitAndSetupBundledPostgres(ctx)
@@ -161,17 +168,22 @@ func (e *Env) postgresManifestPath() string {
 	return e.Cfg.Manifest("postgres", "postgres.yaml")
 }
 
-// applyPostgres renders and applies the bundled PostgreSQL StatefulSet at the
-// selected cluster size.
-func (e *Env) applyPostgres(ctx context.Context) error {
+// preparePostgres renders the bundled PostgreSQL StatefulSet at the selected
+// cluster size, without changing the cluster.
+func (e *Env) preparePostgres(ctx context.Context, plan postgresPlan) (postgresPrepared, error) {
+	prepared := postgresPrepared{plan: plan}
+	if !plan.bundled {
+		return prepared, nil
+	}
 	if err := e.requirePostgresPool(ctx); err != nil {
-		return err
+		return postgresPrepared{}, err
 	}
 	objs, err := e.postgresObjects()
 	if err != nil {
-		return err
+		return postgresPrepared{}, err
 	}
-	return e.Kube.Apply(ctx, objs)
+	prepared.objects = objs
+	return prepared, nil
 }
 
 // postgresObjects renders the bundled PostgreSQL objects with the configured
@@ -353,5 +365,9 @@ func (e *Env) DeployPostgres(ctx context.Context) error {
 		return err
 	}
 
-	return e.deployPostgres(ctx, postgresPlan{bundled: true})
+	postgres, err := e.preparePostgres(ctx, postgresPlan{bundled: true})
+	if err != nil {
+		return err
+	}
+	return e.deployPostgres(ctx, postgres)
 }

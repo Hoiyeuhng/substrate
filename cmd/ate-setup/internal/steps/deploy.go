@@ -145,7 +145,11 @@ func (e *Env) DeployAteSystem(ctx context.Context, opts DeployOptions) error {
 	// and the answer decides both the apply and the rollout wait below. The
 	// bundled database is rendered at its final size before the apply, so the
 	// rollout wait covers the one pod that will actually serve.
-	postgres, err := e.planPostgres(ctx)
+	plan, err := e.planPostgres(ctx)
+	if err != nil {
+		return err
+	}
+	postgres, err := e.preparePostgres(ctx, plan)
 	if err != nil {
 		return err
 	}

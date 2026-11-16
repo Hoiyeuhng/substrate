@@ -33,7 +33,7 @@ import (
 )
 
 // postgresObjects loads the bundled postgres manifest of the given
-// environment, as applyPostgres would before any resizing.
+// environment, as preparePostgres would before any resizing.
 func postgresObjects(t *testing.T, kind bool) []*unstructured.Unstructured {
 	t.Helper()
 	e := &Env{Cfg: &config.Config{Root: repoRoot(t), Kind: kind}}
@@ -348,16 +348,16 @@ func TestRequirePostgresPool(t *testing.T) {
 	}
 }
 
-// applyPostgres is the path both `deploy ate-system` and `deploy postgres`
+// preparePostgres is the path both `deploy ate-system` and `deploy postgres`
 // take to the StatefulSet, so the pool check has to sit in front of it.
-func TestApplyPostgresRequiresPostgresPool(t *testing.T) {
+func TestPreparePostgresRequiresPostgresPool(t *testing.T) {
 	e := &Env{
 		Cfg:  &config.Config{Root: repoRoot(t), CordonSystemInfraComponents: true},
 		Kube: fakeKube(t),
 	}
-	err := e.applyPostgres(t.Context())
+	_, err := e.preparePostgres(t.Context(), postgresPlan{bundled: true})
 	if err == nil || !strings.Contains(err.Error(), postgresPoolSelector) {
-		t.Fatalf("applyPostgres() error = %v, want the missing %s pool", err, postgresPoolSelector)
+		t.Fatalf("preparePostgres() error = %v, want the missing %s pool", err, postgresPoolSelector)
 	}
 }
 
