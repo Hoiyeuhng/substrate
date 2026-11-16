@@ -23,7 +23,7 @@ every setting with its environment variable.
 | `--rollout-timeout DURATION` | Readiness timeout for workloads (default `60s`). It also governs the podcertificate-controller and CSI waits, which stay at their 120s default until it is passed |
 | `--podcert-workers-per-signer N` | Concurrent workers per podcertificate-controller signer |
 | `--cluster-size size0\|size10` | Footprint profile (default `size0`). `size10` assumes a dedicated PostgreSQL node: it resizes the bundled StatefulSet and its `postgresql.conf`, pins the apiserver's connection pool, and raises the podcertificate-controller's API rate limits. `ATE_INSTALL_CLUSTER_SIZE` when the flag is absent |
-| `--ateapi-postgres-storage-class NAME` | StorageClass for the bundled PostgreSQL volume instead of the cluster default, such as `dynamic-rwo` on GKE so C4 and N4 nodes can attach it. An existing install must delete the postgres StatefulSet and its claim first. `ATE_API_POSTGRES_STORAGE_CLASS` when the flag is absent |
+| `--ateapi-postgres-storage-class NAME` | StorageClass for the bundled PostgreSQL volume instead of the cluster default, such as `dynamic-rwo` on GKE so C4 and N4 nodes can attach it. Changes to an existing install are refused before applying; see [Bundled PostgreSQL storage](#bundled-postgresql-storage). `ATE_API_POSTGRES_STORAGE_CLASS` when the flag is absent |
 | `--cordon-system-infra-components` | Keep the system infra components, such as ate-api-server, atenet-router, atenet-egress and postgres, off the worker nodes. Assumes a small shared pool labeled and tainted `ate.dev/workloadType=ate-system-infra:NoSchedule`, across which each workload's replicas are spread, and a one-node pool labeled and tainted `ate.dev/workloadType=ate-postgres:NoSchedule` for postgres alone. `ATE_INSTALL_CORDON_SYSTEM_INFRA_COMPONENTS=true` when the flag is absent |
 | `--fake-data-plane` | Install the fake data plane for control-plane benchmarks: fake-atelet takes atelet's place in its DaemonSet, taking its objectstore-plugin's storage settings, ate-controller is scaled to zero, and fake-workersync honors every WorkerPool with fake Workers on the fake-atelet nodes. Reaches `deploy ate-system`, `deploy atelet`, and `deploy ate-controller`; only `deploy ate-system` switches a cluster between the real and fake data planes, and the other two refuse a data plane other than the installed one. `deploy ate-system --fake-data-plane` refuses a cluster whose WorkerPools have worker pods. fake-atelet runs with its defaults; a benchmark tunes it through the optional `fake-atelet-tuning` ConfigMap, whose `FAKE_ATELET_*` variables set its flags, and which no install creates or resets. Actors do not exist; never use it on a cluster that serves real actors. `ATE_INSTALL_FAKE_DATA_PLANE=true` when the flag is absent |
 | `--ingress-allowed-spiffe-ids IDS` | Comma-separated SPIFFE IDs (exact match) of the clients the ingress router lets reach actors; any listed client may reach any actor. Unset, no client may reach actors through the router. Both dataplanes require a Pod Identity CA client certificate on HTTPS and TLS CONNECT. The SPIFFE URI SAN allowlist may be checked during or after TLS, including after CONNECT acceptance, but unlisted clients must be denied before actor routing. The podidentity signer issues `spiffe://cluster.local/ns/<namespace>/sa/<service-account>`. `ATE_INGRESS_ALLOWED_SPIFFE_IDS` when the flag is absent |
@@ -122,6 +122,21 @@ resources, staging the microVM guest assets into the asset bucket (`rustfs` on
 Kind, `<BUCKET_NAME>-assets` on GKE). It creates every `create` resource below
 on the way, so those subcommands are only needed to redo one on a running
 cluster.
+
+### Bundled PostgreSQL storage
+
+Before applying any resources, `deploy postgres` and `deploy ate-system`
+compare the rendered volume claim template's size and StorageClass with the
+existing `ate-system/postgres` StatefulSet. A difference stops deployment and
+reports the old and requested values. First installations are allowed, and
+`deploy ate-system` skips this check when an external database is configured.
+
+Restore the previous settings to redeploy. To grow storage, expand the
+existing PVC separately if its StorageClass supports expansion, keeping the
+StatefulSet's template unchanged. To change StorageClass or shrink storage,
+back up the database and migrate to new storage. Recreating the installation
+is appropriate only when its data is disposable; do not delete claims that
+contain data you need.
 
 ## Publish
 

@@ -94,6 +94,16 @@ func (e *Env) DeployAteSystem(ctx context.Context, opts DeployOptions) error {
 	if _, err := clusterSnapshotLocation(e.Cfg.SnapshotLocation, e.Cfg.PreviewGates); err != nil {
 		return err
 	}
+	// Storage templates cannot change on an existing StatefulSet. Check before
+	// the namespace, CRDs, or prerequisites are applied.
+	plan, err := e.planPostgres(ctx)
+	if err != nil {
+		return err
+	}
+	postgres, err := e.preparePostgres(ctx, plan)
+	if err != nil {
+		return err
+	}
 	if err := e.requireNoWorkerPods(ctx); err != nil {
 		return err
 	}
@@ -140,15 +150,6 @@ func (e *Env) DeployAteSystem(ctx context.Context, opts DeployOptions) error {
 		return err
 	}
 
-	// Resolved before the bundle apply: adopting a Cloud SQL instance reads
-	// the ConfigMap that EnsureAPIServerPrerequisites has already rewritten,
-	// and the answer decides both the apply and the rollout wait below. The
-	// bundled database is rendered at its final size before the apply, so the
-	// rollout wait covers the one pod that will actually serve.
-	postgres, err := e.planPostgres(ctx)
-	if err != nil {
-		return err
-	}
 	if err := e.deployPostgres(ctx, postgres); err != nil {
 		return err
 	}
