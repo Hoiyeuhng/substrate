@@ -22,8 +22,13 @@ import (
 	"os"
 	"strings"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/yaml"
 
 	"go.ate.dev/substrate/cmd/ate-setup/internal/config"
@@ -121,8 +126,8 @@ type postgresPlan struct {
 	external string
 }
 
-// postgresPrepared holds the database plan and, for the bundled database, the
-// rendered objects to apply.
+// postgresPrepared holds the database plan and the bundled resources checked
+// before deployment changes the cluster.
 type postgresPrepared struct {
 	plan    postgresPlan
 	objects []*unstructured.Unstructured
@@ -168,8 +173,8 @@ func (e *Env) postgresManifestPath() string {
 	return e.Cfg.Manifest("postgres", "postgres.yaml")
 }
 
-// preparePostgres renders the bundled PostgreSQL StatefulSet at the selected
-// cluster size, without changing the cluster.
+// preparePostgres renders and checks the bundled PostgreSQL before deployment
+// changes any cluster resources.
 func (e *Env) preparePostgres(ctx context.Context, plan postgresPlan) (postgresPrepared, error) {
 	prepared := postgresPrepared{plan: plan}
 	if !plan.bundled {
@@ -182,8 +187,78 @@ func (e *Env) preparePostgres(ctx context.Context, plan postgresPlan) (postgresP
 	if err != nil {
 		return postgresPrepared{}, err
 	}
+	if err := e.requirePostgresStorage(ctx, objs); err != nil {
+		return postgresPrepared{}, err
+	}
 	prepared.objects = objs
 	return prepared, nil
+}
+
+// requirePostgresStorage refuses to change the size or StorageClass of an
+// existing StatefulSet's volume claim templates, which Kubernetes rejects only
+// after earlier steps have changed the cluster. It compares the templates, not
+// the PVCs: expanding a PVC does not make the template mutable. Other template
+// fields are not checked.
+func (e *Env) requirePostgresStorage(ctx context.Context, objs []*unstructured.Unstructured) error {
+	var desired appsv1.StatefulSet
+	found := false
+	for _, obj := range objs {
+		if obj.GetKind() == "StatefulSet" && obj.GetName() == "postgres" && obj.GetNamespace() == e.Namespace() {
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &desired); err != nil {
+				return fmt.Errorf("while reading the rendered postgres StatefulSet: %w", err)
+			}
+			found = true
+			break
+		}
+	}
+	if !found || len(desired.Spec.VolumeClaimTemplates) == 0 {
+		return fmt.Errorf("the postgres manifest has no statefulset/postgres volume claim templates")
+	}
+	live, err := e.Kube.Typed.AppsV1().StatefulSets(desired.Namespace).Get(ctx, desired.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("while checking bundled PostgreSQL storage: %w", err)
+	}
+	liveClaims := make(map[string]corev1.PersistentVolumeClaim, len(live.Spec.VolumeClaimTemplates))
+	for _, have := range live.Spec.VolumeClaimTemplates {
+		liveClaims[have.Name] = have
+	}
+	var changes []string
+	for _, want := range desired.Spec.VolumeClaimTemplates {
+		have, ok := liveClaims[want.Name]
+		if !ok {
+			changes = append(changes, fmt.Sprintf("claim %s added", want.Name))
+			continue
+		}
+		delete(liveClaims, want.Name)
+		haveSize, wantSize := have.Spec.Resources.Requests.Storage(), want.Spec.Resources.Requests.Storage()
+		if haveSize.Cmp(*wantSize) != 0 {
+			changes = append(changes, fmt.Sprintf("claim %s storage %s -> %s", want.Name, haveSize, wantSize))
+		}
+		if !ptr.Equal(have.Spec.StorageClassName, want.Spec.StorageClassName) {
+			changes = append(changes, fmt.Sprintf("claim %s StorageClass %s -> %s", want.Name, postgresStorageClassName(have.Spec.StorageClassName), postgresStorageClassName(want.Spec.StorageClassName)))
+		}
+	}
+	for _, have := range live.Spec.VolumeClaimTemplates {
+		if _, ok := liveClaims[have.Name]; ok {
+			changes = append(changes, fmt.Sprintf("claim %s removed", have.Name))
+		}
+	}
+	if len(changes) == 0 {
+		return nil
+	}
+	return fmt.Errorf("cannot change bundled PostgreSQL storage on StatefulSet %s/%s: %s; volume claim templates are immutable, "+
+		"see \"Bundled PostgreSQL storage\" in cmd/ate-setup/commands.md",
+		desired.Namespace, desired.Name, strings.Join(changes, "; "))
+}
+
+func postgresStorageClassName(class *string) string {
+	if class == nil {
+		return "<unset>"
+	}
+	return fmt.Sprintf("%q", *class)
 }
 
 // postgresObjects renders the bundled PostgreSQL objects with the configured
@@ -354,6 +429,11 @@ func applyPostgresSize10Overrides(objs []*unstructured.Unstructured, confPatch [
 func (e *Env) DeployPostgres(ctx context.Context) error {
 	log.Step("deploy_postgres")
 
+	postgres, err := e.preparePostgres(ctx, postgresPlan{bundled: true})
+	if err != nil {
+		return err
+	}
+
 	if err := e.EnsureAteSystemNamespace(ctx); err != nil {
 		return err
 	}
@@ -365,9 +445,5 @@ func (e *Env) DeployPostgres(ctx context.Context) error {
 		return err
 	}
 
-	postgres, err := e.preparePostgres(ctx, postgresPlan{bundled: true})
-	if err != nil {
-		return err
-	}
 	return e.deployPostgres(ctx, postgres)
 }

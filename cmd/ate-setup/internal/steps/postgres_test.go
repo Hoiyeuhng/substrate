@@ -15,6 +15,8 @@
 package steps
 
 import (
+	"context"
+	"errors"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -23,9 +25,17 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes/fake"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 
 	"go.ate.dev/substrate/cmd/ate-setup/internal/config"
 	"go.ate.dev/substrate/cmd/ate-setup/internal/kube"
@@ -233,6 +243,184 @@ func TestPostgresObjectsStorageClass(t *testing.T) {
 			class, set := dataClaimStorageClass(t, objs)
 			if class != tc.wantClass || set != tc.wantSet {
 				t.Errorf("StorageClass = %q (set %v), want %q (set %v)", class, set, tc.wantClass, tc.wantSet)
+			}
+		})
+	}
+}
+
+func TestRequirePostgresStorage(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		liveSize  string
+		wantSize  string
+		liveClass *string
+		wantClass *string
+		absent    bool
+		readErr   error
+		wantErr   string
+	}{
+		{name: "first install", absent: true},
+		{name: "unchanged"},
+		{name: "equivalent units", liveSize: "512000Mi"},
+		{name: "grow", wantSize: "600Gi", wantErr: "storage 500Gi -> 600Gi"},
+		{name: "shrink", wantSize: "400Gi", wantErr: "storage 500Gi -> 400Gi"},
+		{name: "same class", liveClass: ptr.To("standard"), wantClass: ptr.To("standard")},
+		{name: "different class", liveClass: ptr.To("standard"), wantClass: ptr.To("fast"), wantErr: `StorageClass "standard" -> "fast"`},
+		{name: "set class", wantClass: ptr.To("standard"), wantErr: `StorageClass <unset> -> "standard"`},
+		{name: "unset class", liveClass: ptr.To("standard"), wantErr: `StorageClass "standard" -> <unset>`},
+		{name: "disable default class", wantClass: ptr.To(""), wantErr: `StorageClass <unset> -> ""`},
+		{name: "enable default class", liveClass: ptr.To(""), wantErr: `StorageClass "" -> <unset>`},
+		{name: "same empty class", liveClass: ptr.To(""), wantClass: ptr.To("")},
+		{name: "read forbidden", readErr: apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "statefulsets"}, "postgres", errors.New("denied")), wantErr: "denied"},
+		{name: "read failed", readErr: errors.New("connection lost"), wantErr: "connection lost"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			objs := postgresObjects(t, false)
+			var live appsv1.StatefulSet
+			obj := findObject(objs, "StatefulSet", "postgres")
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &live); err != nil {
+				t.Fatal(err)
+			}
+			if tc.liveSize != "" {
+				live.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage] = resource.MustParse(tc.liveSize)
+			}
+			live.Spec.VolumeClaimTemplates[0].Spec.StorageClassName = tc.liveClass
+			desired := live.DeepCopy()
+			size := tc.wantSize
+			if size == "" {
+				size = "500Gi"
+			}
+			desired.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage] = resource.MustParse(size)
+			desired.Spec.VolumeClaimTemplates[0].Spec.StorageClassName = tc.wantClass
+			var err error
+			obj.Object, err = runtime.DefaultUnstructuredConverter.ToUnstructured(desired)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := fake.NewClientset()
+			if !tc.absent {
+				if err := client.Tracker().Add(&live); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.readErr != nil {
+				client.PrependReactor("get", "statefulsets", func(clienttesting.Action) (bool, runtime.Object, error) {
+					return true, nil, tc.readErr
+				})
+			}
+			e := &Env{Cfg: &config.Config{}, Kube: &kube.Client{Typed: client}}
+			err = e.requirePostgresStorage(t.Context(), objs)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("requirePostgresStorage() = %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("requirePostgresStorage() = %v, want %q", err, tc.wantErr)
+			}
+			if tc.wantErr != "" && tc.readErr == nil {
+				for _, want := range []string{"ate-system/postgres", "volume claim templates are immutable", "Bundled PostgreSQL storage"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q does not mention %q", err, want)
+					}
+				}
+			}
+			if tc.readErr != nil && !errors.Is(err, tc.readErr) {
+				t.Errorf("error %v does not wrap %v", err, tc.readErr)
+			}
+			for _, action := range client.Actions() {
+				if action.GetVerb() != "get" {
+					t.Errorf("storage check made a %s request", action.GetVerb())
+				}
+			}
+		})
+	}
+}
+
+func TestDeployRefusesPostgresStorageBeforeApply(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		deploy     func(*Env, context.Context) error
+		liveSize   string
+		class      string
+		wantChange string
+		external   string
+		cloudSQL   config.CloudSQLConfig
+		recorded   map[string]string
+	}{
+		{name: "postgres grow", deploy: (*Env).DeployPostgres, liveSize: "512Mi", wantChange: "storage 512Mi -> 1Gi"},
+		{name: "postgres shrink", deploy: (*Env).DeployPostgres, wantChange: "storage 2Gi -> 1Gi"},
+		{name: "postgres class", deploy: (*Env).DeployPostgres, liveSize: "1Gi", class: "fast", wantChange: `StorageClass <unset> -> "fast"`},
+		{name: "ate-system grow", liveSize: "512Mi", wantChange: "storage 512Mi -> 1Gi"},
+		{name: "ate-system shrink", wantChange: "storage 2Gi -> 1Gi"},
+		{name: "ate-system class", liveSize: "1Gi", class: "fast", wantChange: `StorageClass <unset> -> "fast"`},
+		{name: "external DSN skips storage check", external: "postgresql://db.example.com/atepg"},
+		{name: "explicit Cloud SQL skips storage check", cloudSQL: config.CloudSQLConfig{Instance: "p:r:i", InstanceSet: true}},
+		{name: "adopted Cloud SQL skips storage check", recorded: map[string]string{envCloudSQLInstance: "p:r:i"}},
+		{name: "removed Cloud SQL checks storage", cloudSQL: config.CloudSQLConfig{InstanceSet: true}, recorded: map[string]string{envCloudSQLInstance: "p:r:i"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var live appsv1.StatefulSet
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(findObject(postgresObjects(t, true), "StatefulSet", "postgres").Object, &live); err != nil {
+				t.Fatal(err)
+			}
+			size := tc.liveSize
+			if size == "" {
+				size = "2Gi"
+			}
+			live.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage] = resource.MustParse(size)
+			client := fake.NewClientset(&live)
+			if cm := apiServerEnvVarsConfigMap(tc.recorded); cm != nil {
+				if err := client.Tracker().Add(cm); err != nil {
+					t.Fatal(err)
+				}
+			}
+			client.Resources = []*metav1.APIResourceList{{GroupVersion: "v1", APIResources: []metav1.APIResource{{Name: "namespaces", Kind: "Namespace"}}}}
+			dynamic := dynamicfake.NewSimpleDynamicClient(clientgoscheme.Scheme)
+			stop := errors.New("stop at first apply")
+			dynamic.PrependReactor("*", "*", func(clienttesting.Action) (bool, runtime.Object, error) {
+				return true, nil, stop
+			})
+			e := &Env{
+				Cfg: &config.Config{
+					Root: repoRoot(t), Kind: true,
+					CredentialProviderJSON: `{"enabled":false}`, SnapshotLocation: "gs://test-snapshots",
+					PostgresStorageClass:              tc.class,
+					PostgresReadWriteConnectionString: tc.external, CloudSQL: tc.cloudSQL,
+				},
+				Kube: kube.NewFromClients(nil, client, dynamic, client.Discovery()),
+			}
+			deploy := tc.deploy
+			if deploy == nil {
+				deploy = func(e *Env, ctx context.Context) error {
+					return e.DeployAteSystem(ctx, DeployOptions{SetupCSI: "none", SandboxClasses: "gvisor"})
+				}
+			}
+			err := deploy(e, t.Context())
+			external := tc.external != "" || tc.cloudSQL.Instance != "" || (tc.recorded != nil && !tc.cloudSQL.InstanceSet)
+			if external {
+				if !errors.Is(err, stop) {
+					t.Fatalf("deploy = %v, want it to reach the first apply for an external database", err)
+				}
+				for _, action := range client.Actions() {
+					if action.GetResource().Resource == "statefulsets" {
+						t.Error("external database checked the bundled StatefulSet")
+					}
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "cannot change bundled PostgreSQL storage") {
+				t.Fatalf("deploy = %v, want the storage refusal", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantChange) {
+				t.Errorf("deploy error = %v, want %q", err, tc.wantChange)
+			}
+			for _, action := range client.Actions() {
+				if action.GetVerb() != "get" {
+					t.Errorf("deploy made a %s request before refusing storage changes", action.GetVerb())
+				}
+			}
+			if len(dynamic.Actions()) != 0 {
+				t.Errorf("deploy made requests before refusing storage changes: %v", dynamic.Actions())
 			}
 		})
 	}
