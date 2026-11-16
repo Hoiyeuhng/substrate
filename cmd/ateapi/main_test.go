@@ -278,7 +278,12 @@ func TestBuildServerTLSConfigReloadsCACertsWithoutRestart(t *testing.T) {
 		t.Fatalf("GetConfigForClient() first call error = %v", err)
 	}
 
-	writeCA(t, path, "ca-two")
+	// Atomic replacement changes file identity even when size and mtime match.
+	rotated := path + ".rotated"
+	writeCA(t, rotated, "ca-two")
+	if err := os.Rename(rotated, path); err != nil {
+		t.Fatalf("Rename() error = %v", err)
+	}
 
 	after, err := cfg.GetConfigForClient(nil)
 	if err != nil {
